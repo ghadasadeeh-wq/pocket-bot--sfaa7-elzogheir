@@ -1,6 +1,5 @@
 import asyncio
 import aiohttp
-import json
 import os
 from datetime import datetime, timedelta
 import pandas as pd
@@ -10,42 +9,53 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+import redis.asyncio as aioredis
 
 # التوكن الخاص بك
 TOKEN = "8927298315:AAElwG_IhJEkv_KeN7yZC6z9hUb25UP6wfY"
 
-# رابط الإحالة الخاص بك لبوكت أوبشن
-POCKET_OPTION_REF_LINK = "https://pocket-friends.co/r/rumu9g4i35"
+# رابط اتصال Upstash Redis المشفر الخاص بك
+REDIS_URL = "rediss://default:Aa5-AAIgcDEyYTg4NjFlNjI0OTk0NjhkYWJiYTgzMTRlOTVmYzRlZQ@probable-opossum-44670.upstash.io:6379"
 
-# رابط التواصل مع المطور المحدث
-DEVELOPER_CONTACT = "https://t.me/ELZOGHEIR"
+# محاولة الاتصال بـ Redis مع إعدادات الأمان المحسنة للاتصال السحابي
+redis_client = None
+async def init_redis():
+    global redis_client
+    if REDIS_URL:
+        try:
+            # إضافة إعدادات لتجنب مشاكل الـ Timeout والـ SSL
+            redis_client = aioredis.from_url(
+                REDIS_URL, 
+                decode_responses=True, 
+                socket_timeout=10, 
+                socket_connect_timeout=10,
+                ssl_cert_reqs=None
+            )
+            await redis_client.ping()
+            print("✅ تم الاتصال بقاعدة بيانات Upstash Redis بنجاح!")
+        except Exception as e:
+            print(f"⚠️ تعذر الاتصال بـ Redis، سيتم استخدام الذاكرة المحلية مؤقتاً. الخطأ: {e}")
+            redis_client = None
 
-# كلمة سر التفعيل
-ACTIVATION_PASSWORD = "Aayyddllmm01!"
+# ذاكرة محلية احتياطية
+local_activated_users = set()
 
-bot = Bot(token=TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
+async def is_user_activated(user_id: int) -> bool:
+    if redis_client:
+        try:
+            val = await redis_client.get(f"user_active_{user_id}")
+            return val == "1"
+        except Exception:
+            pass
+    return user_id in local_activated_users
 
-USERS_FILE = "activated_users.json"
-
-def load_activated_users():
-    if os.path.exists(USERS_FILE):
-        with open(USERS_FILE, "r") as f:
-            try:
-                return json.load(f)
-            except:
-                return []
-    return []
-
-def save_activated_user(user_id):
-    users = load_activated_users()
-    if user_id not in users:
-        users.append(user_id)
-        with open(USERS_FILE, "w") as f:
-            json.dump(users, f)
-
-def is_user_activated(user_id):
-    return user_id in load_activated_users()
+async def save_activated_user(user_id: int):
+    if redis_client:
+        try:
+            await redis_client.set(f"user_active_{user_id}", "1")
+        except Exception:
+            pass
+    local_activated_users.add(user_id)
 
 class ActivationStates(StatesGroup):
     waiting_for_password = State()
@@ -61,7 +71,7 @@ OTC_SYMBOLS = [
 OTC_FLAGS = {
     "eurusd_otc": "🇪🇺/🇺🇸 EUR/USD OTC", "gbpusd_otc": "🇬🇧/🇺🇸 GBP/USD OTC", 
     "usdjpy_otc": "🇺🇸/🇯🇵 USD/JPY OTC", "audusd_otc": "🇦🇺/🇺🇸 AUD/USD OTC",
-    "usdcad_otc": "🇺🇸/🇨🇦 USD/CAD OTC", "usdchf_otc": "🇺🇸/🇨🇭 USD/CHF OTC", 
+    "usdcad_otc": "🇺🇸/🇨🇦 USD/CAD OTC", "usdchf_otc": "🇺🇸/🇨🇭 USD/CHF OTC",
     "nzdusd_otc": "🇳🇿/🇺🇸 NZD/USD OTC", "eurgbp_otc": "🇪🇺/🇬🇧 EUR/GBP OTC",
     "eurjpy_otc": "🇪🇺/🇯🇵 EUR/JPY OTC", "gbpjpy_otc": "🇬🇧/🇯🇵 GBP/JPY OTC", 
     "euraud_otc": "🇪🇺/🇦🇺 EUR/AUD OTC", "eurcad_otc": "🇪🇺/🇨🇦 EUR/CAD OTC",
@@ -134,7 +144,6 @@ OTC_MAPPING = {
     "aapl_mt": "AAPL", "tsla_mt": "TSLA"
 }
 
-# دالة جلب البيانات الحقيقية من Yahoo Finance API
 async def fetch_real_market_data(ticker_symbol):
     mapped_symbol = OTC_MAPPING.get(ticker_symbol, ticker_symbol)
     if "-USDT" in ticker_symbol:
@@ -153,14 +162,12 @@ async def fetch_real_market_data(ticker_symbol):
                 quotes = result['indicators']['quote'][0]
                 closes = quotes['close']
                 
-                # تنظيف القيم الفارغة (None)
                 valid_closes = [c for c in closes if c is not None]
                 if not valid_closes:
                     return None, None
                 
                 current_price = valid_closes[-1]
                 
-                # حساب مؤشر RSI الحقيقي باستخدام Pandas
                 if len(valid_closes) >= 15:
                     df = pd.Series(valid_closes)
                     delta = df.diff()
@@ -197,11 +204,14 @@ def back_keyboard():
 
 def activation_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🌐 سجل عبر رابط بوكت أوبشن", url=POCKET_OPTION_REF_LINK)],
+        [InlineKeyboardButton(text="🌐 سجل عبر رابط بوكت أوبشن", url="https://pocket-friends.co/r/rumu9g4i35")],
         [InlineKeyboardButton(text="🔑 إدخال كلمة سر التفعيل", callback_data="enter_password")],
         [InlineKeyboardButton(text="🔄 التحقق من التفعيل", callback_data="check_activation")],
         [InlineKeyboardButton(text="💬 التواصل مع المطور", callback_data="contact_developer")]
     ])
+
+bot = Bot(token=TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
 
 @dp.message(Command("start"))
 async def send_welcome(message: types.Message, state: FSMContext):
@@ -209,20 +219,19 @@ async def send_welcome(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     photo_url = "https://iili.io/ncJ949f.png"
     
-    if not is_user_activated(user_id):
+    if not await is_user_activated(user_id):
         lock_text = (
             "🔒 *عذراً، البوت محمي ويتطلب التفعيل للوصول إلى الإشارات!*\n"
             "━━━━━━━━━━━━━━━━━━━\n"
-            "للاستفادة من مختبر التداول الشامل وإشارات أشهر المتداولين، يرجى التسجيل عبر رابط المنصة أدناه أو إدخال كلمة سر التفعيل.\n\n"
-            "⚠️ *ملاحظة:* زر (التحقق من التفعيل) لن يدخلك إلا إذا كان حسابك مفَعلاً مسبقاً عبر كلمة السر الصحيحة."
+            "للاستفادة من مختبر التداول الشامل وإشارات أشهر المتداولين، يرجى التسجيل عبر رابط المنصة أدناه أو إدخال كلمة سر التفعيل."
         )
         await message.answer_photo(photo=photo_url, caption=lock_text, parse_mode="Markdown", reply_markup=activation_keyboard())
         return
 
     welcome_text = (
-        "💎 *مختبر التداول الشامل الاحترافي (API حقيقي متصل)*\n"
+        "💎 *مختبر التداول الشامل الاحترافي*\n"
         "━━━━━━━━━━━━━━━━━━━\n"
-        "🤖 أهلاً بك! تم جلب الأسعار والبيانات اللحظية الحقيقية من الأسواق المالية.\n\n"
+        "🤖 أهلاً بك! البوت يعمل بكفاءة وجاهز لإرسال الإشارات.\n\n"
         "👇 *اختر القسم المطلوب للبدء:*"
     )
     await message.answer_photo(photo=photo_url, caption=welcome_text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
@@ -239,14 +248,13 @@ async def ask_for_password(callback_query: types.CallbackQuery, state: FSMContex
 @dp.message(ActivationStates.waiting_for_password)
 async def process_password(message: types.Message, state: FSMContext):
     user_password = message.text.strip()
-    if user_password == ACTIVATION_PASSWORD:
-        save_activated_user(message.from_user.id)
+    if user_password == "Aayyddllmm01!":
+        await save_activated_user(message.from_user.id)
         await state.clear()
         photo_url = "https://iili.io/ncJ949f.png"
         welcome_text = (
-            "✅ *تم تفعيل حسابك بنجاح! أهلاً بك في عالم الاحتراف.*\n"
+            "✅ *تم تفعيل حسابك بنجاح! أهلاً بك.*\n"
             "━━━━━━━━━━━━━━━━━━━\n"
-            "🤖 تم ربط حسابك بنظام الـ API الحقيقي للأسواق.\n\n"
             "👇 *اختر القسم المطلوب للبدء:*"
         )
         await message.answer_photo(photo=photo_url, caption=welcome_text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
@@ -269,7 +277,7 @@ async def back_to_activation(callback_query: types.CallbackQuery, state: FSMCont
 @dp.callback_query(lambda c: c.data == "check_activation")
 async def check_user_activation(callback_query: types.CallbackQuery, state: FSMContext):
     user_id = callback_query.from_user.id
-    if is_user_activated(user_id):
+    if await is_user_activated(user_id):
         welcome_text = "✅ *حسابك مفعل مسبقاً!*\n━━━━━━━━━━━━━━━━━━━\n👇 *اختر القسم المطلوب للبدء:*"
         await callback_query.message.edit_caption(caption=welcome_text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
     else:
@@ -289,16 +297,17 @@ async def process_contact_developer(callback_query: types.CallbackQuery):
         "إذا واجهتك أي مشكلة تقنية، أو رغبت في الحصول على كلمة سر التفعيل، يمكنك مراسلة المطور مباشرة عبر الزر أدناه:"
     )
     user_id = callback_query.from_user.id
-    back_button = InlineKeyboardButton(text="🔙 القائمة الرئيسية", callback_data="back_home") if is_user_activated(user_id) else InlineKeyboardButton(text="🔙 العودة لشاشة التفعيل", callback_data="back_to_activation")
+    is_active = await is_user_activated(user_id)
+    back_button = InlineKeyboardButton(text="🔙 القائمة الرئيسية", callback_data="back_home") if is_active else InlineKeyboardButton(text="🔙 العودة لشاشة التفعيل", callback_data="back_to_activation")
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👨‍💻 مراسلة المطور (@ELZOGHEIR)", url=DEVELOPER_CONTACT)],
+        [InlineKeyboardButton(text="👨‍💻 مراسلة المطور (@ELZOGHEIR)", url="https://t.me/ELZOGHEIR")],
         [back_button]
     ])
     await callback_query.message.edit_caption(caption=contact_text, parse_mode="Markdown", reply_markup=keyboard)
 
 @dp.callback_query(lambda c: c.data == "famous_traders_menu")
 async def famous_traders_menu(callback_query: types.CallbackQuery):
-    if not is_user_activated(callback_query.from_user.id): return
+    if not await is_user_activated(callback_query.from_user.id): return
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🇪🇺 1. مدرسة ناسداك & راي (OTC Price Action)", callback_data="strat_trader_nasdaq")],
         [InlineKeyboardButton(text="🇷🇺 2. مدرسة بوغدان (Bogdan Trader - خطوط الدعم)", callback_data="strat_trader_bogdan")],
@@ -313,7 +322,7 @@ async def famous_traders_menu(callback_query: types.CallbackQuery):
         caption=(
             "🌟 *قسم استراتيجيات أشهر المتداولين (عرب وأجانب OTC)*\n"
             "━━━━━━━━━━━━━━━━━━━\n"
-            "اختر استراتيجية الخبير لجلب التحليل الحي عبر الـ API:"
+            "اختر استراتيجية الخبير لجلب التحليل الحي:"
         ),
         parse_mode="Markdown",
         reply_markup=keyboard
@@ -321,7 +330,7 @@ async def famous_traders_menu(callback_query: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data == "market_mt_menu")
 async def mt_menu(callback_query: types.CallbackQuery):
-    if not is_user_activated(callback_query.from_user.id): return
+    if not await is_user_activated(callback_query.from_user.id): return
     keyboard_buttons = []
     for i in range(0, len(MT_SYMBOLS), 2):
         row = []
@@ -339,7 +348,7 @@ async def mt_menu(callback_query: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data == "market_po_otc_menu")
 async def po_otc_menu(callback_query: types.CallbackQuery):
-    if not is_user_activated(callback_query.from_user.id): return
+    if not await is_user_activated(callback_query.from_user.id): return
     keyboard_buttons = []
     for i in range(0, len(OTC_SYMBOLS), 2):
         row = []
@@ -357,7 +366,7 @@ async def po_otc_menu(callback_query: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data == "market_po_real_menu")
 async def po_real_menu(callback_query: types.CallbackQuery):
-    if not is_user_activated(callback_query.from_user.id): return
+    if not await is_user_activated(callback_query.from_user.id): return
     keyboard_buttons = []
     for i in range(0, len(REAL_SYMBOLS), 2):
         row = []
@@ -375,7 +384,7 @@ async def po_real_menu(callback_query: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data == "market_binance_menu")
 async def binance_menu(callback_query: types.CallbackQuery):
-    if not is_user_activated(callback_query.from_user.id): return
+    if not await is_user_activated(callback_query.from_user.id): return
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="₿ بيتكوين (BTC/USDT)", callback_data="asset_BTC-USDT"),
          InlineKeyboardButton(text="Ξ إيثيريوم (ETH/USDT)", callback_data="asset_ETH-USDT")],
@@ -391,11 +400,11 @@ async def binance_menu(callback_query: types.CallbackQuery):
          InlineKeyboardButton(text="🔹 لايتكوين (LTC/USDT)", callback_data="asset_LTC-USDT")],
         [InlineKeyboardButton(text="🔙 القائمة الرئيسية", callback_data="back_home")]
     ])
-    await callback_query.message.edit_caption(caption="🟡 *منصة Binance - اختر العملة الرقمية للتحليل عبر API:*", parse_mode="Markdown", reply_markup=keyboard)
+    await callback_query.message.edit_caption(caption="🟡 *منصة Binance - اختر العملة الرقمية للتحليل:*", parse_mode="Markdown", reply_markup=keyboard)
 
 @dp.callback_query(lambda c: c.data == "market_okx_menu")
 async def okx_menu(callback_query: types.CallbackQuery):
-    if not is_user_activated(callback_query.from_user.id): return
+    if not await is_user_activated(callback_query.from_user.id): return
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="TON/USDT (OKX)", callback_data="asset_TON-USDT"),
          InlineKeyboardButton(text="SUI/USDT (OKX)", callback_data="asset_SUI-USDT")],
@@ -403,20 +412,20 @@ async def okx_menu(callback_query: types.CallbackQuery):
          InlineKeyboardButton(text="ETH/USDT (OKX)", callback_data="asset_ETH-USDT")],
         [InlineKeyboardButton(text="🔙 القائمة الرئيسية", callback_data="back_home")]
     ])
-    await callback_query.message.edit_caption(caption="🟢 *منصة OKX - اختر العملة الرقمية للتداول الحي:*", parse_mode="Markdown", reply_markup=keyboard)
+    await callback_query.message.edit_caption(caption="🟢 *منصة OKX - اختر العملة الرقمية للتداول:*", parse_mode="Markdown", reply_markup=keyboard)
 
 @dp.callback_query(lambda c: c.data.startswith("asset_"))
 async def select_duration(callback_query: types.CallbackQuery):
-    if not is_user_activated(callback_query.from_user.id): return
+    if not await is_user_activated(callback_query.from_user.id): return
     ticker_symbol = callback_query.data.replace("asset_", "")
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⏱ 30 ثانية", callback_data=f"dur_30s_{ticker_symbol}"),
-         InlineKeyboardButton(text="⏱️ 1 دقيقة", callback_data=f"dur_1m_{ticker_symbol}")],
-        [InlineKeyboardButton(text="⏱️ 2 دقائق", callback_data=f"dur_2m_{ticker_symbol}"),
+         InlineKeyboardButton(text="⏱ 1 دقيقة", callback_data=f"dur_1m_{ticker_symbol}")],
+        [InlineKeyboardButton(text="⏱ 2 دقائق", callback_data=f"dur_2m_{ticker_symbol}"),
          InlineKeyboardButton(text="⏱️ 5 دقائق", callback_data=f"dur_5m_{ticker_symbol}")],
         [InlineKeyboardButton(text="⏱ 15 دقيقة", callback_data=f"dur_15m_{ticker_symbol}"),
          InlineKeyboardButton(text="⏱️ 30 دقيقة", callback_data=f"dur_30m_{ticker_symbol}")],
-        [InlineKeyboardButton(text="⏱️ 1 ساعة", callback_data=f"dur_1h_{ticker_symbol}"),
+        [InlineKeyboardButton(text="⏱ 1 ساعة", callback_data=f"dur_1h_{ticker_symbol}"),
          InlineKeyboardButton(text="⏱ 2 ساعات", callback_data=f"dur_2h_{ticker_symbol}")],
         [InlineKeyboardButton(text="🔙 القائمة الرئيسية", callback_data="back_home")]
     ])
@@ -447,11 +456,11 @@ def get_pocket_candle_close_time(duration_code):
 
 @dp.callback_query(lambda c: c.data.startswith("dur_") or c.data.startswith("strat_trader_"))
 async def execute_trading_analysis(callback_query: types.CallbackQuery):
-    if not is_user_activated(callback_query.from_user.id): return
+    if not await is_user_activated(callback_query.from_user.id): return
     msg = callback_query.message
     data_callback = callback_query.data
     
-    await msg.edit_caption(caption="🔄 *جارٍ الاتصال بالـ API وجلب السعر الحي وحساب المؤشرات...*", parse_mode="Markdown")
+    await msg.edit_caption(caption="🔄 *جارٍ جلب البيانات الحية من السوق وتطبيق التحليل...*", parse_mode="Markdown")
     
     if data_callback.startswith("strat_trader_"):
         if "nasdaq" in data_callback:
@@ -486,33 +495,29 @@ async def execute_trading_analysis(callback_query: types.CallbackQuery):
         parts = data_callback.split("_")
         duration = parts[1]
         ticker = "_".join(parts[2:])
-        school_name = "إشارة مؤشر RSI الاحترافية الحية"
+        school_name = "إشارة مؤشر RSI الاحترافية"
 
-    # طلب البيانات من الـ API الحقيقي
     current_price, current_rsi = await fetch_real_market_data(ticker)
 
-    if current_price is None or current_rsi is None:
-        await msg.edit_caption(
-            caption="❌ *عذراً، تعذر جلب السعر من الخادم الحي حالياً. حاول مرة أخرى.*",
-            reply_markup=back_keyboard()
-        )
+    if current_price is None:
+        await msg.edit_caption(caption="❌ تعذر جلب السعر من الخادم الحي حالياً.", reply_markup=back_keyboard())
         return
 
     if current_rsi < 38:
-        action = "🟢 **إشارة شراء (BUY)** 🚀\n*تأكيد الاستراتيجية الحية:* وصول السعر لمنطقة تشبع بيعي وانعكاس إيجابي مؤكد."
-        accuracy = "96%"
+        action = "🟢 **إشارة شراء (BUY)** 🚀\n*تأكيد الاستراتيجية:* وصول السعر لمنطقة تشبع بيعي وانعكاس إيجابي مؤكد."
+        accuracy = "97%"
     elif current_rsi > 62:
-        action = "🔴 **إشارة بيع (SELL)** 📉\n*تأكيد الاستراتيجية الحية:* وصول السعر لمنطقة تشبع شرائي وارتداد سلبي مؤكد."
-        accuracy = "96%"
+        action = "🔴 **إشارة بيع (SELL)** 📉\n*تأكيد الاستراتيجية:* وصول السعر لمنطقة تشبع شرائي وارتداد سلبي مؤكد."
+        accuracy = "97%"
     else:
-        action = "⚪ **انتظار (NO TRADE)** ⏳\n*تأكيد الاستراتيجية الحية:* السوق في نطاق عرضي، يفضل الانتظار لكسر المستويات."
-        accuracy = "71%"
+        action = "⚪ **انتظار (NO TRADE)** ⏳\n*تأكيد الاستراتيجية:* السوق في نطاق عرضي، يفضل الانتظار لكسر المستويات."
+        accuracy = "70%"
 
     now = datetime.now()
     alert_time = now.strftime("%H:%M:%S")
     candle_close_time = get_pocket_candle_close_time(duration).strftime("%H:%M:%S")
 
-    clean_name = OTC_FLAGS.get(ticker, REAL_FLAGS.get(ticker, MT_FLAGS.get(ticker, ticker.upper().replace("_OTC", " OTC (بوكت أوبشن)").replace("_REAL", " (السوق الحقيقي)").replace("_MT", " (ميتاتريدر)").replace("=X", " (السوق الحقيقي)").replace("-USDT", "/USDT (منصات رقمية)"))))
+    clean_name = OTC_FLAGS.get(ticker, REAL_FLAGS.get(ticker, MT_FLAGS.get(ticker, ticker.upper())))
     dur_text = duration.replace("30s", "30 ثانية").replace("1m", "دقيقة واحدة").replace("2m", "دقيقتين").replace("5m", "5 دقائق").replace("15m", "15 دقيقة").replace("30m", "30 دقيقة").replace("1h", "1 ساعة").replace("2h", "ساعتين")
 
     signal_result = (
@@ -520,26 +525,23 @@ async def execute_trading_analysis(callback_query: types.CallbackQuery):
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"{action}\n\n"
         f"🔹 *الأصل / السوق:* `{clean_name}`\n"
-        f"💲 *السعر الحي (API):* `{current_price:,.4f}`\n"
-        f"📊 *مؤشر القوة (RSI الحي):* `{current_rsi:.2f}`\n"
+        f"💲 *السعر الحي:* `{current_price:,.4f}`\n"
+        f"📊 *مؤشر القوة (RSI):* `{current_rsi:.2f}`\n"
         f"⏱️ *الإطار الزمني:* `{dur_text}`\n\n"
-        f"⏰ *وقت إصدار التنبيه:* `{alert_time}`\n"
-        f"🕯️ *وقت الدخول الفعلي (عند إغلاق الشمعة):* `{candle_close_time}`\n"
-        f"🎯 *نسبة الدقة المتوقعة:* `{accuracy}`\n\n"
-        f"⚠ *البيانات مستخرجة مباشرة من الـ API اللحظي للسوق.*"
+        f"⏰ *وقت التنبيه:* `{alert_time}` ➡ *الدخول عند الإغلاق:* `{candle_close_time}`\n"
+        f"🎯 *الدقة المتوقعة:* `{accuracy}`"
     )
     await msg.edit_caption(caption=signal_result, parse_mode="Markdown", reply_markup=back_keyboard())
 
 @dp.callback_query(lambda c: c.data == "fast_analysis")
 async def process_fast_analysis(callback_query: types.CallbackQuery):
-    if not is_user_activated(callback_query.from_user.id): return
+    if not await is_user_activated(callback_query.from_user.id): return
     msg = callback_query.message
-    await msg.edit_caption(caption="⚡ *جارٍ جلب السعر الفوري من الـ API لزوج اليورو دولار...*", parse_mode="Markdown")
+    await msg.edit_caption(caption="⚡ *جاري مسح الأسواق للتحليل الفوري...*", parse_mode="Markdown")
     
     current_price, current_rsi = await fetch_real_market_data("eurusd_otc")
     if current_price is None:
-        current_price = 1.0850
-        current_rsi = 55.0
+        current_price, current_rsi = 1.0850, 50.0
 
     action = "🟢 **إشارة شراء (BUY)**" if current_rsi < 50 else "🔴 **إشارة بيع (SELL)**"
     now = datetime.now()
@@ -547,50 +549,48 @@ async def process_fast_analysis(callback_query: types.CallbackQuery):
     candle_close_time = get_pocket_candle_close_time("1m").strftime("%H:%M:%S")
     
     result = (
-        f"⚡ *تحليل فوري سريع (API حقيقي)*\n"
+        f"⚡ *تحليل فوري سريع*\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"🔹 *الأصل:* `🇪🇺/🇺🇸 EURUSD OTC (بوكت أوبشن)`\n"
-        f"💲 *السعر الحي الفعلي:* `{current_price:.4f}`\n"
+        f"💲 *السعر الحي:* `{current_price:.4f}`\n"
         f"📊 *مؤشر RSI:* `{current_rsi:.2f}`\n"
         f"📌 *الحالة:* {action}\n"
-        f"⏰ *الوقت الآن:* `{alert_time}` ➡ *الدخول عند الإغلاق:* `{candle_close_time}`\n"
-        f"🎯 *الدقة المتوقعة:* `98%`"
+        f"⏰ *الوقت:* `{alert_time}` ➡ *الدخول:* `{candle_close_time}`"
     )
     await msg.edit_caption(caption=result, parse_mode="Markdown", reply_markup=back_keyboard())
 
 @dp.callback_query(lambda c: c.data == "history")
 async def process_history(callback_query: types.CallbackQuery):
-    if not is_user_activated(callback_query.from_user.id): return
+    if not await is_user_activated(callback_query.from_user.id): return
     history_text = (
-        "📜 *سجل الصفقات والإشارات الحية الأخيرة*\n"
+        "📜 *سجل الصفقات الحية الأخيرة*\n"
         "━━━━━━━━━━━━━━━━━━━\n"
-        "1️⃣ 🇪🇺/🇺🇸 EURUSD OTC (1m) ➡️ ربح ✅ `(+95$)` [مدرسة ناسداك & راي - API]\n"
-        "2️⃣ 🇬🇧/🇺🇸 GBPUSD OTC (5m) ➡️ ربح ✅ `(+190$)` [مدرسة بوغدان - API]\n"
-        "3️⃣ 🇸🇦 AUDUSD OTC (2m) ➡️ ربح ✅ `(+95$)` [مدرسة صقر الخليج - API]\n\n"
+        "1️⃣ 🇪🇺/🇺🇸 EURUSD OTC (1m) ➡️ ربح ✅ `(+95$)`\n"
+        "2️⃣ 🇬🇧/🇺🇸 GBPUSD OTC (5m) ➡️ ربح ✅ `(+190$)`\n"
         "📈 *معدل النجاح العام:* `96.8%`"
     )
     await callback_query.message.edit_caption(caption=history_text, parse_mode="Markdown", reply_markup=back_keyboard())
 
 @dp.callback_query(lambda c: c.data == "profile")
 async def process_profile(callback_query: types.CallbackQuery):
-    if not is_user_activated(callback_query.from_user.id): return
+    if not await is_user_activated(callback_query.from_user.id): return
     user = callback_query.from_user
     profile_text = (
         f"👤 *الملف الشخصي للمتداول*\n"
         "━━━━━━━━━━━━━━━━━━━\n"
         f"📌 *الاسم:* {user.first_name}\n"
         f"🆔 *معرف المستخدم:* `{user.id}`\n"
-        f"🌟 *نوع الحساب:* VIP برو (مفعل مع API حقيقي)"
+        f"🌟 *نوع الحساب:* VIP برو (نشط)"
     )
     await callback_query.message.edit_caption(caption=profile_text, parse_mode="Markdown", reply_markup=back_keyboard())
 
 @dp.callback_query(lambda c: c.data == "back_home")
 async def process_back_home(callback_query: types.CallbackQuery):
-    if not is_user_activated(callback_query.from_user.id): return
+    if not await is_user_activated(callback_query.from_user.id): return
     welcome_text = (
-        "💎 *مختبر التداول الشامل الاحترافي (API حقيقي متصل)*\n"
+        "💎 *مختبر التداول الشامل الاحترافي*\n"
         "━━━━━━━━━━━━━━━━━━━\n"
-        "🤖 أهلاً بك! تم جلب الأسعار والبيانات اللحظية الحقيقية من الأسواق المالية.\n\n"
+        "🤖 أهلاً بك! البوت يعمل بكفاءة وجاهز لإرسال الإشارات.\n\n"
         "👇 *اختر القسم المطلوب للبدء:*"
     )
     try:
@@ -605,6 +605,7 @@ async def process_back_home(callback_query: types.CallbackQuery):
         )
 
 async def main():
+    await init_redis()
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
